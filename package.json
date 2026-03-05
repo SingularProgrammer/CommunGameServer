@@ -1,0 +1,12 @@
+{
+  "name": "commun-game-server",
+  "version": "1.0.0",
+  "description": "WebSocket game server for Commun project",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js"
+  },
+  "dependencies": {
+    "ws": "^8.13.0"
+  }
+}
