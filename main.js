@@ -1,4 +1,10 @@
 const WebSocket = require('ws');
+const fs = require('fs');
+
+// --- FIREBASE AYARLARI ---
+// Bu URL'leri kendi projenize göre güncelleyin. Sonunda "/" olmamasına dikkat edin.
+const FIREBASE_RTDB_URL = "https://commun-game-default-rtdb.firebaseio.com";
+const FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/commun-game/databases/(default)/documents";
 
 const SeededPRNG = function(seed) { this.seed = seed || 1; this.next = function() { this.seed = (this.seed * 9301 + 49297) % 233280; return this.seed / 233280; }; };
 const SimplexNoise = function(seed) {
@@ -60,6 +66,50 @@ let entities = {};
 let teams = {}; 
 let time = 8000;
 
+// --- KAYIT SİSTEMİ (SAVE/LOAD) ---
+const SAVE_FILE = './save.json';
+
+function loadGame() {
+    if (fs.existsSync(SAVE_FILE)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(SAVE_FILE, 'utf8'));
+            chunks = data.chunks || {};
+            entities = data.entities || {};
+            teams = data.teams || {};
+            time = data.time || 8000;
+            
+            if (data.players) {
+                Object.values(data.players).forEach(p => {
+                    players[p.id] = { ...p, ws: null, activeChunks: new Set() };
+                });
+            }
+            console.log("Kayıt dosyası başarıyla yüklendi.");
+        } catch (e) {
+            console.error("Kayıt dosyası okunurken hata oluştu:", e);
+        }
+    } else {
+        console.log("Mevcut bir kayıt dosyası bulunamadı, yeni dünya başlatılıyor.");
+    }
+}
+
+function saveGame() {
+    let savedPlayers = {};
+    Object.values(players).forEach(p => {
+        savedPlayers[p.id] = {
+            id: p.id, username: p.username, team: p.team,
+            x: p.x, y: p.y, hp: p.hp, maxHp: p.maxHp, hunger: p.hunger, stamina: p.stamina,
+            invites: p.invites
+        };
+    });
+    const dataToSave = { chunks, entities, teams, time, players: savedPlayers };
+    fs.writeFileSync(SAVE_FILE, JSON.stringify(dataToSave));
+}
+
+// Oyunu başlatırken yükle
+loadGame();
+// Her 30 saniyede bir otomatik kaydet
+setInterval(saveGame, 30000);
+
 const Utils = { distance: (x1,y1,x2,y2) => Math.sqrt((x2-x1)**2 + (y2-y1)**2) };
 
 function getBaseTile(tx, ty) {
@@ -94,22 +144,79 @@ function spawnDroppedItem(baseId, amount, x, y) {
 const wss = new WebSocket.Server({ port: PORT });
 
 wss.on('connection', (ws) => {
-    let pid = "p_" + Date.now() + Math.floor(Math.random()*1000);
-    let sx = 0, sy = 0; while(getBaseTile(sx, sy) === 0 || TILES[getBaseTile(sx, sy)].solid) { sx++; sy++; }
-    
-    players[pid] = {
-        id: pid, ws: ws, username: "Oyuncu_" + Math.floor(Math.random()*1000), team: null,
-        x: sx * TILE_SIZE + TILE_SIZE/2, y: sy * TILE_SIZE + TILE_SIZE/2,
-        hp: 100, maxHp: 100, hunger: 100, stamina: 100,
-        activeChunks: new Set(), invites: []
-    };
+    // 1. Yeni bağlanan istemciye doğrulama kodu oluştur ve gönder
+    const authCode = Math.random().toString(36).substring(2, 10);
+    ws.send(JSON.stringify({ type: 'AUTH_REQ', code: authCode }));
 
-    ws.send(JSON.stringify({ type: 'INIT', id: pid, seed: SEED, x: players[pid].x, y: players[pid].y, time: time }));
-    broadcastMsg("Sistem", `${players[pid].username} oyuna katıldı. / joined the game.`, 'global');
+    let authenticated = false;
+    let pid = null;
 
-    ws.on('message', (message) => {
+    ws.on('message', async (message) => {
         let data; try { data = JSON.parse(message); } catch(e) { return; }
-        let p = players[pid]; if(!p) return;
+
+        // --- DOĞRULAMA SÜRECİ ---
+        if (!authenticated) {
+            if (data.type === 'AUTH_SUBMIT' && data.uid) {
+                try {
+                    const uid = data.uid;
+                    
+                    // Realtime DB kontrolü
+                    const rtdbRes = await fetch(`${FIREBASE_RTDB_URL}/user-server-keys/${uid}.json`);
+                    const rtdbData = await rtdbRes.json();
+                    
+                    let isValid = false;
+                    if (typeof rtdbData === 'string' && rtdbData === authCode) isValid = true;
+                    else if (rtdbData && typeof rtdbData === 'object') {
+                        if (rtdbData.code === authCode || Object.values(rtdbData).includes(authCode)) isValid = true;
+                    }
+
+                    if (!isValid) {
+                        ws.send(JSON.stringify({ type: 'AUTH_FAIL', msg: 'Geçersiz doğrulama kodu.' }));
+                        return;
+                    }
+
+                    // Firestore'dan Username çekme
+                    const fsRes = await fetch(`${FIRESTORE_URL}/Users/${uid}`);
+                    const fsData = await fsRes.json();
+                    
+                    let username = "Oyuncu_" + uid.substring(0, 5);
+                    if (fsData && fsData.fields && fsData.fields.username && fsData.fields.username.stringValue) {
+                        username = fsData.fields.username.stringValue;
+                    }
+
+                    authenticated = true;
+                    pid = uid;
+
+                    // Kullanıcı daha önce kayıt edilmiş mi kontrol et
+                    if (!players[pid]) {
+                        let sx = 0, sy = 0; while(getBaseTile(sx, sy) === 0 || TILES[getBaseTile(sx, sy)].solid) { sx++; sy++; }
+                        players[pid] = {
+                            id: pid, ws: ws, username: username, team: null,
+                            x: sx * TILE_SIZE + TILE_SIZE/2, y: sy * TILE_SIZE + TILE_SIZE/2,
+                            hp: 100, maxHp: 100, hunger: 100, stamina: 100,
+                            activeChunks: new Set(), invites: []
+                        };
+                    } else {
+                        // Var olan oyuncu yeniden bağlandı
+                        players[pid].ws = ws;
+                        players[pid].username = username; // Username güncellenmiş olabilir
+                        players[pid].activeChunks = new Set();
+                    }
+
+                    ws.send(JSON.stringify({ type: 'INIT', id: pid, seed: SEED, x: players[pid].x, y: players[pid].y, time: time }));
+                    broadcastMsg("Sistem", `${players[pid].username} oyuna katıldı.`, 'global');
+
+                } catch (err) {
+                    ws.send(JSON.stringify({ type: 'AUTH_FAIL', msg: 'Sunucu doğrulama hatası.' }));
+                    console.error("Doğrulama Hatası:", err);
+                }
+            }
+            return;
+        }
+
+        // --- OYUN İÇİ İŞLEMLER ---
+        let p = players[pid]; 
+        if(!p || !p.ws) return;
 
         if (data.type === 'MOVE') {
             p.x = data.x; p.y = data.y; p.hp = data.hp; p.hunger = data.hunger; p.stamina = data.stamina;
@@ -223,17 +330,17 @@ wss.on('connection', (ws) => {
         }
         else if (data.type === 'CLAN_CREATE') {
             if (p.team) return;
-            if (teams[data.name]) { p.ws.send(JSON.stringify({type:'CHAT', sender:'Sistem', msg:'Klan adı mevcut. / Clan name exists.'})); return; }
+            if (teams[data.name]) { p.ws.send(JSON.stringify({type:'CHAT', sender:'Sistem', msg:'Klan adı mevcut.'})); return; }
             teams[data.name] = { name: data.name, owner: p.id, members: [p.id] };
             p.team = data.name;
         }
         else if (data.type === 'CLAN_INVITE') {
             if (!p.team || teams[p.team].owner !== p.id) return;
-            let target = Object.values(players).find(pl => pl.username === data.username);
+            let target = Object.values(players).find(pl => pl.username === data.username && pl.ws);
             if (target && !target.team) {
                 if (!target.invites.some(i => i.clanName === p.team)) {
                     target.invites.push({ clanName: p.team, senderName: p.username });
-                    target.ws.send(JSON.stringify({type:'CHAT', sender:'Sistem', msg:`${p.team} klanından davet. / Invite from ${p.team}.`}));
+                    target.ws.send(JSON.stringify({type:'CHAT', sender:'Sistem', msg:`${p.team} klanından davet.`}));
                 }
             }
         }
@@ -265,7 +372,9 @@ wss.on('connection', (ws) => {
                 t.members = t.members.filter(id => id !== data.targetId);
                 if (players[data.targetId]) {
                     players[data.targetId].team = null;
-                    players[data.targetId].ws.send(JSON.stringify({type:'CHAT', sender:'Sistem', msg:`Klandan atıldınız / Kicked from clan.`}));
+                    if (players[data.targetId].ws) {
+                        players[data.targetId].ws.send(JSON.stringify({type:'CHAT', sender:'Sistem', msg:`Klandan atıldınız.`}));
+                    }
                 }
             }
         }
@@ -273,7 +382,7 @@ wss.on('connection', (ws) => {
             if (data.msg.startsWith('/')) handleCommand(p, data.msg);
             else {
                 if (data.channel === 'team' && p.team) {
-                    Object.values(players).forEach(target => { if(target.team === p.team) target.ws.send(JSON.stringify({type:'CHAT', sender: `[Takım] ${p.username}`, msg: data.msg})); });
+                    Object.values(players).forEach(target => { if(target.team === p.team && target.ws) target.ws.send(JSON.stringify({type:'CHAT', sender: `[Takım] ${p.username}`, msg: data.msg})); });
                 } else {
                     broadcastMsg(p.username, data.msg, 'global');
                 }
@@ -282,37 +391,31 @@ wss.on('connection', (ws) => {
     });
 
     ws.on('close', () => { 
-        broadcastMsg("Sistem", `${players[pid].username} ayrıldı. / left.`, 'global'); 
-        if (players[pid].team) {
-            let t = teams[players[pid].team];
-            if (t) {
-                t.members = t.members.filter(id => id !== pid);
-                if (t.members.length === 0) { delete teams[players[pid].team]; }
-                else if (t.owner === pid) { t.owner = t.members[0]; }
-            }
+        if (authenticated && pid && players[pid]) {
+            broadcastMsg("Sistem", `${players[pid].username} ayrıldı.`, 'global'); 
+            // Oyuncuyu silmek yerine çevrimdışı işaretliyoruz, verileri kalıcı oluyor
+            players[pid].ws = null;
         }
-        delete players[pid]; 
     });
 });
 
 function handleCommand(p, cmdStr) {
     let args = cmdStr.trim().split(' '); let cmd = args[0].toLowerCase();
-    if (cmd === '/isim' || cmd === '/name') {
-        if(args[1]) {
-            let old = p.username; p.username = args.slice(1).join(' '); 
-            broadcastMsg("Sistem", `${old} -> ${p.username}`, 'global');
-        }
+    // İsim değiştirme komutu güvenlik gereği Firestore tarafına taşındığı için kapatıldı
+    // veya sadece geçici display name olarak kullanılabilir.
+    if (cmd === '/isim') {
+        p.ws.send(JSON.stringify({type:'CHAT', sender:'Sistem', msg:'İsim değiştirme işlemi artık desteklenmiyor.'}));
     }
 }
 
 function broadcastMsg(sender, msg, channel) {
     let packet = JSON.stringify({ type: 'CHAT', sender, msg, channel });
-    Object.values(players).forEach(p => p.ws.send(packet));
+    Object.values(players).forEach(p => { if (p.ws) p.ws.send(packet); });
 }
 
 function broadcastChunkUpdate(cKey) {
     let packet = JSON.stringify({ type: 'CHUNK_DATA', cKey: cKey, data: chunks[cKey] });
-    Object.values(players).forEach(p => { if (p.activeChunks.has(cKey)) p.ws.send(packet); });
+    Object.values(players).forEach(p => { if (p.ws && p.activeChunks.has(cKey)) p.ws.send(packet); });
 }
 
 let lastTick = Date.now();
@@ -332,10 +435,12 @@ setInterval(() => {
         for (let i = c.droppedItems.length - 1; i >= 0; i--) { if (now > c.droppedItems[i].expire) { c.droppedItems.splice(i, 1); broadcastChunkUpdate(cKey); } }
     });
 
-    if (Object.keys(entities).length < Object.keys(players).length * 5) {
-        let pList = Object.values(players);
-        if (pList.length > 0) {
-            let rp = pList[Math.floor(Math.random() * pList.length)];
+    // Aktif (çevrimiçi) oyuncu sayısına göre yaratık spawnla
+    let activePlayers = Object.values(players).filter(p => p.ws);
+    
+    if (Object.keys(entities).length < activePlayers.length * 5) {
+        if (activePlayers.length > 0) {
+            let rp = activePlayers[Math.floor(Math.random() * activePlayers.length)];
             let angle = Math.random() * Math.PI * 2; let dist = 500 + Math.random() * 300;
             let sx = rp.x + Math.cos(angle) * dist; let sy = rp.y + Math.sin(angle) * dist;
             let stx = Math.floor(sx/TILE_SIZE); let sty = Math.floor(sy/TILE_SIZE);
@@ -350,7 +455,11 @@ setInterval(() => {
     Object.values(entities).forEach(ent => {
         let def = ENTITY_TYPES[ent.type]; ent.timer -= dt; ent.attackCooldown = Math.max(0, ent.attackCooldown - dt);
         let nearestP = null; let minDist = Infinity;
-        Object.values(players).forEach(p => { let d = Utils.distance(ent.x, ent.y, p.x, p.y); if (d < minDist) { minDist = d; nearestP = p; } });
+        
+        activePlayers.forEach(p => { 
+            let d = Utils.distance(ent.x, ent.y, p.x, p.y); 
+            if (d < minDist) { minDist = d; nearestP = p; } 
+        });
         
         if (minDist > 2000) { delete entities[ent.id]; return; }
 
@@ -384,10 +493,11 @@ setInterval(() => {
         if (!TILES[getTile(Math.floor(ent.x/TILE_SIZE), Math.floor(ny/TILE_SIZE))].solid) ent.y = ny; else ent.vy *= -1;
     });
 
-    let sPlayers = Object.values(players).map(p => ({ id: p.id, username: p.username, team: p.team, x: p.x, y: p.y, hp: p.hp, maxHp: p.maxHp }));
+    // Yalnızca aktif (çevrimiçi) oyuncuları istemcilere gönder
+    let sPlayers = activePlayers.map(p => ({ id: p.id, username: p.username, team: p.team, x: p.x, y: p.y, hp: p.hp, maxHp: p.maxHp }));
     let sEntities = Object.values(entities);
     
-    Object.values(players).forEach(p => {
+    activePlayers.forEach(p => {
         let teamData = null;
         if (p.team && teams[p.team]) {
             teamData = {
