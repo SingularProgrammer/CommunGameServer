@@ -1,10 +1,10 @@
 const WebSocket = require('ws');
 const fs = require('fs');
 
-// --- FIREBASE AYARLARI ---
-// Bu URL'leri kendi projenize göre güncelleyin. Sonunda "/" olmamasına dikkat edin.
-const FIREBASE_RTDB_URL = "https://commun-game-default-rtdb.firebaseio.com";
+// --- FIREBASE & SUNUCU AYARLARI ---
+const FIREBASE_RTDB_URL = "https://commun-game-default-rtdb.europe-west1.firebasedatabase.app";
 const FIRESTORE_URL = "https://firestore.googleapis.com/v1/projects/commun-game/databases/(default)/documents";
+const SERVER_NAME = "official-server"; // Sunucunun benzersiz anahtar ismi
 
 const SeededPRNG = function(seed) { this.seed = seed || 1; this.next = function() { this.seed = (this.seed * 9301 + 49297) % 233280; return this.seed / 233280; }; };
 const SimplexNoise = function(seed) {
@@ -66,7 +66,7 @@ let entities = {};
 let teams = {}; 
 let time = 8000;
 
-// --- KAYIT SİSTEMİ (SAVE/LOAD) ---
+// --- KAYIT SİSTEMİ ---
 const SAVE_FILE = './save.json';
 
 function loadGame() {
@@ -83,12 +83,9 @@ function loadGame() {
                     players[p.id] = { ...p, ws: null, activeChunks: new Set() };
                 });
             }
-            console.log("Kayıt dosyası başarıyla yüklendi.");
         } catch (e) {
-            console.error("Kayıt dosyası okunurken hata oluştu:", e);
+            console.error("Kayıt dosyası okunurken hata:", e);
         }
-    } else {
-        console.log("Mevcut bir kayıt dosyası bulunamadı, yeni dünya başlatılıyor.");
     }
 }
 
@@ -105,9 +102,7 @@ function saveGame() {
     fs.writeFileSync(SAVE_FILE, JSON.stringify(dataToSave));
 }
 
-// Oyunu başlatırken yükle
 loadGame();
-// Her 30 saniyede bir otomatik kaydet
 setInterval(saveGame, 30000);
 
 const Utils = { distance: (x1,y1,x2,y2) => Math.sqrt((x2-x1)**2 + (y2-y1)**2) };
@@ -144,9 +139,8 @@ function spawnDroppedItem(baseId, amount, x, y) {
 const wss = new WebSocket.Server({ port: PORT });
 
 wss.on('connection', (ws) => {
-    // 1. Yeni bağlanan istemciye doğrulama kodu oluştur ve gönder
     const authCode = Math.random().toString(36).substring(2, 10);
-    ws.send(JSON.stringify({ type: 'AUTH_REQ', code: authCode }));
+    ws.send(JSON.stringify({ type: 'AUTH_REQ', code: authCode, serverName: SERVER_NAME }));
 
     let authenticated = false;
     let pid = null;
@@ -154,28 +148,23 @@ wss.on('connection', (ws) => {
     ws.on('message', async (message) => {
         let data; try { data = JSON.parse(message); } catch(e) { return; }
 
-        // --- DOĞRULAMA SÜRECİ ---
         if (!authenticated) {
             if (data.type === 'AUTH_SUBMIT' && data.uid) {
                 try {
                     const uid = data.uid;
                     
-                    // Realtime DB kontrolü
-                    const rtdbRes = await fetch(`${FIREBASE_RTDB_URL}/user-server-keys/${uid}.json`);
+                    // Güncellenmiş Realtime DB kontrolü (UID -> SERVER_NAME -> değer)
+                    const rtdbRes = await fetch(`${FIREBASE_RTDB_URL}/user-server-keys/${uid}/${SERVER_NAME}.json`);
                     const rtdbData = await rtdbRes.json();
                     
                     let isValid = false;
-                    if (typeof rtdbData === 'string' && rtdbData === authCode) isValid = true;
-                    else if (rtdbData && typeof rtdbData === 'object') {
-                        if (rtdbData.code === authCode || Object.values(rtdbData).includes(authCode)) isValid = true;
-                    }
+                    if (rtdbData === authCode) isValid = true;
 
                     if (!isValid) {
                         ws.send(JSON.stringify({ type: 'AUTH_FAIL', msg: 'Geçersiz doğrulama kodu.' }));
                         return;
                     }
 
-                    // Firestore'dan Username çekme
                     const fsRes = await fetch(`${FIRESTORE_URL}/Users/${uid}`);
                     const fsData = await fsRes.json();
                     
@@ -187,7 +176,6 @@ wss.on('connection', (ws) => {
                     authenticated = true;
                     pid = uid;
 
-                    // Kullanıcı daha önce kayıt edilmiş mi kontrol et
                     if (!players[pid]) {
                         let sx = 0, sy = 0; while(getBaseTile(sx, sy) === 0 || TILES[getBaseTile(sx, sy)].solid) { sx++; sy++; }
                         players[pid] = {
@@ -197,9 +185,8 @@ wss.on('connection', (ws) => {
                             activeChunks: new Set(), invites: []
                         };
                     } else {
-                        // Var olan oyuncu yeniden bağlandı
                         players[pid].ws = ws;
-                        players[pid].username = username; // Username güncellenmiş olabilir
+                        players[pid].username = username;
                         players[pid].activeChunks = new Set();
                     }
 
@@ -214,7 +201,6 @@ wss.on('connection', (ws) => {
             return;
         }
 
-        // --- OYUN İÇİ İŞLEMLER ---
         let p = players[pid]; 
         if(!p || !p.ws) return;
 
@@ -379,7 +365,7 @@ wss.on('connection', (ws) => {
             }
         }
         else if (data.type === 'CHAT') {
-            if (data.msg.startsWith('/')) handleCommand(p, data.msg);
+            if (data.msg.startsWith('/')) { /* Komutlar kapalı */ }
             else {
                 if (data.channel === 'team' && p.team) {
                     Object.values(players).forEach(target => { if(target.team === p.team && target.ws) target.ws.send(JSON.stringify({type:'CHAT', sender: `[Takım] ${p.username}`, msg: data.msg})); });
@@ -393,20 +379,10 @@ wss.on('connection', (ws) => {
     ws.on('close', () => { 
         if (authenticated && pid && players[pid]) {
             broadcastMsg("Sistem", `${players[pid].username} ayrıldı.`, 'global'); 
-            // Oyuncuyu silmek yerine çevrimdışı işaretliyoruz, verileri kalıcı oluyor
             players[pid].ws = null;
         }
     });
 });
-
-function handleCommand(p, cmdStr) {
-    let args = cmdStr.trim().split(' '); let cmd = args[0].toLowerCase();
-    // İsim değiştirme komutu güvenlik gereği Firestore tarafına taşındığı için kapatıldı
-    // veya sadece geçici display name olarak kullanılabilir.
-    if (cmd === '/isim') {
-        p.ws.send(JSON.stringify({type:'CHAT', sender:'Sistem', msg:'İsim değiştirme işlemi artık desteklenmiyor.'}));
-    }
-}
 
 function broadcastMsg(sender, msg, channel) {
     let packet = JSON.stringify({ type: 'CHAT', sender, msg, channel });
@@ -435,7 +411,6 @@ setInterval(() => {
         for (let i = c.droppedItems.length - 1; i >= 0; i--) { if (now > c.droppedItems[i].expire) { c.droppedItems.splice(i, 1); broadcastChunkUpdate(cKey); } }
     });
 
-    // Aktif (çevrimiçi) oyuncu sayısına göre yaratık spawnla
     let activePlayers = Object.values(players).filter(p => p.ws);
     
     if (Object.keys(entities).length < activePlayers.length * 5) {
@@ -493,7 +468,6 @@ setInterval(() => {
         if (!TILES[getTile(Math.floor(ent.x/TILE_SIZE), Math.floor(ny/TILE_SIZE))].solid) ent.y = ny; else ent.vy *= -1;
     });
 
-    // Yalnızca aktif (çevrimiçi) oyuncuları istemcilere gönder
     let sPlayers = activePlayers.map(p => ({ id: p.id, username: p.username, team: p.team, x: p.x, y: p.y, hp: p.hp, maxHp: p.maxHp }));
     let sEntities = Object.values(entities);
     
