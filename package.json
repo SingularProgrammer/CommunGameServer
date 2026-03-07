@@ -1,12 +1,16 @@
 {
-  "name": "commun-game-server",
+  "name": "commun-server",
   "version": "1.0.0",
-  "description": "WebSocket game server for Commun project",
-  "main": "main.js",
+  "description": "Commun multiplayer game server",
+  "author": "Singular Programmer",
+  "main": "index.js",
   "scripts": {
-    "start": "node main.js"
+    "start": "node index.js"
   },
   "dependencies": {
-    "ws": "^8.13.0"
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
